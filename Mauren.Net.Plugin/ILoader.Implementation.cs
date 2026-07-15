@@ -1,15 +1,9 @@
 ﻿using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
 using System.Reflection;
 using System.Runtime.Loader;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace Mauren.Net.Plugin
 {
@@ -55,6 +49,7 @@ namespace Mauren.Net.Plugin
         {
             _logger = logger;
             _configuration = configuration;
+            _serviceProvider = serviceProvider;
             _registry = new();
         }
 
@@ -148,6 +143,7 @@ namespace Mauren.Net.Plugin
                 // If the dependency's load context is the same as the implementation type's load context
                 if (dependencyLoadContext == implementationLoadContext)
                 {
+                    _logger.LogDebug("Looking for {type} dependency {dependencyType} in assembly {name}", implementationType.Name, parameter.ParameterType.Name, implementationType.Assembly.FullName);
                     // Get the matching dependency from the implementation type's assembly
                     Type dependency = implementationType.Assembly.GetTypes()
                         // Filter to types that the parameter's type is assignable from
@@ -163,8 +159,13 @@ namespace Mauren.Net.Plugin
                 // If the dependency's load context is not the same as the implementation type's load context
                 else
                 {
+                    _logger.LogDebug("Looking for {type} dependency {dependencyType} in host service provider", implementationType.Name, parameter.ParameterType.Name);
                     // Get a matching dependency from the host application's service provider
-                    Object dependency = _serviceProvider.GetRequiredService(parameter.ParameterType);
+                    Object dependency = _serviceProvider.GetRequiredService(parameter.ParameterType) switch
+                    {
+                        Object value => value,
+                        _ => throw new InvalidOperationException($"Failed to resolve dependency '{parameter.ParameterType.FullName}'"),
+                    };
 
                     // Add the dependency as a singleton implementation of the parameter type
                     services.AddSingleton(parameter.ParameterType, dependency);
@@ -172,6 +173,7 @@ namespace Mauren.Net.Plugin
             }
 
             // Register the plugin
+            services.AddTransient(implementationType);
             services.AddTransient(typeof(TPlugin), implementationType);
 
             // Build the service provider
