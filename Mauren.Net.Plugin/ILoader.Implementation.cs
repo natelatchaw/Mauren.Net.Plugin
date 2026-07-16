@@ -10,7 +10,6 @@ namespace Mauren.Net.Plugin
     public partial class Loader<TPlugin> : ILoader<TPlugin>
     {
         private readonly ILogger<Loader<TPlugin>> _logger;
-        private readonly IConfiguration _configuration;
         private readonly ConcurrentDictionary<LoadContext<TPlugin>, ConcurrentBag<Type>> _registry;
         /// <summary>
         /// The host application's <see cref="IServiceProvider"/>.
@@ -29,97 +28,97 @@ namespace Mauren.Net.Plugin
             PluginUnloaded?.Invoke(this, e);
         }
 
-        public DirectoryInfo Directory
-        {
-            get
-            {
-                String path = _configuration.GetValue<String>("PluginPath", "./Plugins");
-                DirectoryInfo directory = new(path);
-                if (directory.Exists is false)
-                {
-                    _logger.LogWarning($"Specified plugin directory '{path}' does not exist");
-                    directory.Create();
-                    _logger.LogInformation($"Created plugin directory '{path}'");
-                }
-                return directory;
-            }
-        }
-
-        public Loader(ILogger<Loader<TPlugin>> logger, IConfiguration configuration, IServiceProvider serviceProvider)
+        public Loader(ILogger<Loader<TPlugin>> logger, IServiceProvider serviceProvider)
         {
             _logger = logger;
-            _configuration = configuration;
             _serviceProvider = serviceProvider;
             _registry = new();
         }
 
-        public async Task ScanAsync(CancellationToken cancellationToken = default)
+        public DirectoryInfo GetDirectoryFromConfiguration(IConfiguration configuration, String key = "PluginPath", String defaultValue = "./Plugins")
         {
-            _logger.LogInformation("Beginning scan of plugin directory '{directory}'", Directory.FullName);
-            IEnumerable<FileInfo> files = Directory.EnumerateFiles("*.dll", SearchOption.AllDirectories);
+            // Read the path value from configuration
+            String path = configuration.GetValue<String>(key, defaultValue);
+            // Initialize directory info
+            DirectoryInfo directoryInfo = new(path);
+            // Return directory info
+            return directoryInfo;
+        }
+
+        public async Task ScanAsync(DirectoryInfo directory, CancellationToken cancellationToken = default)
+        {
+            // Ensure the provided directory exists
+            EnsureDirectoryExists(directory, createIfNotExists: true);
+
+            // Ensure the log level is enabled
+            if (_logger.IsEnabled(LogLevel.Information))
+                // Log information
+                _logger.Log(LogLevel.Information, "Directory scan starting for '{path}': Discovering {type}", directory.FullName, typeof(TPlugin).Name);
+
+            // Enumerate files in directory
+            IEnumerable<FileInfo> files = directory.EnumerateFiles("*.dll", SearchOption.AllDirectories);
 
             // Iterate through the plugin assembly files and load them into their own LoadContext
             foreach (FileInfo file in files)
             {
-                // If the file's directory name is null, throw an exception
-                if (file.DirectoryName is not String directoryName)
-                {
-                    // This should never happen, but just in case
-                    _logger.LogWarning("Directory name for file '{path}' is null", file.FullName);
-                    // Skip this file and continue
-                    continue;
-                }
+                // Initialize an assembly load context
+                AssemblyLoadContext? assemblyLoadContext = null;
 
-                // Create a new LoadContext for the plugin assembly
-                LoadContext<TPlugin> loadContext = new(directoryName);
-
-                // Initialize assembly variable
-                Assembly assembly;
                 try
                 {
-                    // Load the assembly from the file path
-                    assembly = loadContext.LoadFromAssemblyPath(file.FullName);
-                }
-                catch (BadImageFormatException exception)
-                {
-                    // Unload the LoadContext
-                    loadContext?.Unload();
-                    // Log the exception and continue with the next file
-                    _logger.LogError(exception, "Failed to load plugin assembly '{path}'", file.FullName);
-                    // Skip this file and continue
-                    continue;
-                }
+                    // If the file's directory name is null
+                    if (file.DirectoryName is not String directoryName)
+                        // Throw exception
+                        throw new DirectoryNotFoundException("Could not determine directory name");
 
-                // Initialize implementations variable
-                IEnumerable<Type> implementationTypes;
-                try
-                {
-                    // Determine implementation types
-                    implementationTypes = assembly.GetTypes()
-                        // Filter to types implementing the plugin interface
+                    // Initialize the assembly load context
+                    assemblyLoadContext = new LoadContext<TPlugin>(directoryName);
+
+                    // Load the assembly via the load context
+                    Assembly assembly = assemblyLoadContext.LoadFromAssemblyPath(file.FullName);
+
+                    // Discover types exported from the assembly
+                    IEnumerable<Type> discoveredTypes = assembly.GetExportedTypes()
+                        // Filter to types implementing the interface
                         .Where((Type type) => typeof(TPlugin).IsAssignableFrom(type))
                         // Filter to non-abstract classes
                         .Where((Type type) => type.IsClass && !type.IsAbstract);
-                }
-                catch (ReflectionTypeLoadException exception)
-                {
-                    // Unload the LoadContext
-                    loadContext?.Unload();
-                    // Log the exception and continue with the next file
-                    _logger.LogError(exception, "Failed to load types from assembly '{path}'", assembly.FullName);
-                    // Skip this file and continue
-                    continue;
-                }
 
-                // Iterate over found implementation types
-                foreach (Type implementationType in implementationTypes)
+                    // Ensure the assembly load context is a LoadContext<T> instance
+                    if (assemblyLoadContext is not LoadContext<TPlugin> context)
+                        continue;
+
+                    // Iterate over the discovered types
+                    foreach (Type discoveredType in discoveredTypes)
+                    {
+                        // Add the discovered type
+                        await AddAsync(context, discoveredType, cancellationToken);
+                    }
+
+                    // Ensure the log level is enabled
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        // Log result
+                        _logger.Log(LogLevel.Debug, "Assembly load succeeded for '{file}'", file.FullName);
+                }
+                catch (Exception exception)
                 {
-                    // Add the implementation type
-                    await AddAsync(loadContext, implementationType, cancellationToken);
+                    // Ensure the log level is enabled
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        // Log exception
+                        _logger.Log(LogLevel.Debug, exception, "Assembly load failed for '{file}'", file.FullName);
+                    
+                    // Unload the assembly load context, if initialized
+                    assemblyLoadContext?.Unload();
+
+                    // Skip the file
+                    continue;
                 }
             }
 
-            _logger.LogInformation("Completed scan of plugin directory '{directory}': Found {count}", Directory.FullName, _registry.Count);
+            // Ensure the log level is enabled
+            if (_logger.IsEnabled(LogLevel.Information))
+                // Log result
+                _logger.Log(LogLevel.Information, "Directory scan complete for '{path}': Discovered {type} ({count})", directory.FullName, typeof(TPlugin).Name, _registry.Count);
         }
 
         private Boolean MatchesStartupConvention(Type type)
@@ -332,6 +331,33 @@ namespace Mauren.Net.Plugin
 
             // Return the unloaded load context
             return entry.Key;
+        }
+
+        private void EnsureDirectoryExists(DirectoryInfo directoryInfo, Boolean createIfNotExists = true)
+        {
+            // If the directory does not exist
+            if (directoryInfo.Exists is false)
+            {
+                // Ensure the log level is enabled
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    // Log
+                    _logger.Log(LogLevel.Debug, "Directory does not exist: {path}", directoryInfo.FullName);
+
+                // If the signal to create the directory was provided
+                if (createIfNotExists)
+                {
+                    // Create the directory
+                    directoryInfo.Create();
+
+                    // Ensure the log level is enabled
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        // Log
+                        _logger.Log(LogLevel.Debug, "Directory has been created: {path}", directoryInfo.FullName);
+                }
+
+                // Otherwise
+                else throw new DirectoryNotFoundException();
+            }
         }
     }
 }

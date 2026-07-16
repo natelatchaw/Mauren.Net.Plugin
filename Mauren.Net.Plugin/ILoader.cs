@@ -1,9 +1,4 @@
-﻿using System;
-using System.IO;
-using System.Threading;
-using System.Threading.Tasks;
-
-namespace Mauren.Net.Plugin
+﻿namespace Mauren.Net.Plugin
 {
     /// <summary>
     /// Scans the specified <see cref="Directory"/> for <typeparamref name="TPlugin"/> implementations.
@@ -14,11 +9,6 @@ namespace Mauren.Net.Plugin
     /// </typeparam>
     public interface ILoader<TPlugin>
     {
-        /// <summary>
-        /// The <see cref="DirectoryInfo">directory</see> from which to load <typeparamref name="TPlugin"/> implementations.
-        /// </summary>
-        public DirectoryInfo Directory { get; }
-
         /// <summary>
         /// Fired when a <typeparamref name="TPlugin"/> implementation has been loaded.
         /// </summary>
@@ -33,11 +23,15 @@ namespace Mauren.Net.Plugin
         /// Scans the <see cref="Directory"/> for <typeparamref name="TPlugin"/> implementations.
         /// </summary>
         /// 
+        /// <param name="directory">
+        /// The directory to scan for <typeparamref name="TPlugin"/> implementations.
+        /// </param>
+        /// 
         /// <param name="cancellationToken">
         /// </param>
         /// 
         /// <returns>
         /// </returns>
-        public Task ScanAsync(CancellationToken cancellationToken = default);
+        public Task ScanAsync(DirectoryInfo directory, CancellationToken cancellationToken = default);
     }
 }
