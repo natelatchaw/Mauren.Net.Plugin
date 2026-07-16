@@ -7,7 +7,7 @@ using System.Runtime.Loader;
 
 namespace Mauren.Net.Plugin
 {
-    public class Loader<TPlugin> : ILoader<TPlugin>
+    public partial class Loader<TPlugin> : ILoader<TPlugin>
     {
         private readonly ILogger<Loader<TPlugin>> _logger;
         private readonly IConfiguration _configuration;
@@ -122,7 +122,92 @@ namespace Mauren.Net.Plugin
             _logger.LogInformation("Completed scan of plugin directory '{directory}': Found {count}", Directory.FullName, _registry.Count);
         }
 
-        internal async Task<IServiceProvider> RegisterAsync(Type implementationType, CancellationToken cancellationToken = default)
+        private Boolean MatchesStartupConvention(Type type)
+        {
+            // If the type's name does not end in 'Startup'
+            if (type.Name.EndsWith("Startup", StringComparison.OrdinalIgnoreCase) is false)
+                return false;
+
+            String name = "ConfigureServices";
+            BindingFlags bindingFlags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static;
+            Binder? binder = null;
+            Type[] types = [typeof(IServiceCollection)];
+            ParameterModifier[]? modifiers = null;
+            // If the type does not have a 'void ConfigureServices(IServiceCollection _)' method
+            if (type.GetMethod(name, bindingFlags, binder, types, modifiers) is not MethodInfo methodInfo || methodInfo.ReturnType != typeof(void))
+                return false;
+
+            return true;
+        }
+
+        internal IServiceProvider GetProvider(Type implementationType)
+        {
+            // Construct a new service collection for the type
+            IServiceCollection services = new ServiceCollection();
+
+            // Get the assembly of the type
+            Assembly assembly = implementationType.Assembly;
+
+            // Get all exported types that implement a manifest
+            IEnumerable<Type> manifestTypes = assembly.GetExportedTypes()
+                // Filter to types that implement a manifest
+                .Where((Type type) => typeof(IServiceManifest).IsAssignableFrom(type))
+                // Filter to non-abstract class types
+                .Where((Type type) => type.IsClass && !type.IsAbstract);
+
+            // Iterate over exported manifest types
+            foreach (Type manifestType in manifestTypes)
+            {
+                // Create an instance of the manifest type
+                Object? instance = Activator.CreateInstance(manifestType);
+                // If the instance is not a manifest, skip
+                if (instance is not IServiceManifest manifest) continue;
+                // Register the manifest's services into the service collection
+                manifest.RegisterServices(services);
+            }
+
+            // Get all exported types that implement the Startup convention
+            IEnumerable<Type> startupTypes = assembly.GetExportedTypes()
+                // Filter to types that match the Startup class convention
+                .Where(MatchesStartupConvention)
+                // Filter to non-abstract class types
+                .Where((Type type) => type.IsClass && !type.IsAbstract);
+
+            // Iterate over exported manifest types
+            foreach (Type startupType in startupTypes)
+            {
+                // Create an instance of the manifest type
+                Object? instance = Activator.CreateInstance(startupType);
+                // If the instance is not a manifest, skip
+                if (instance is not Object startup) continue;
+
+                String name = "ConfigureServices";
+                BindingFlags bindingFlags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static;
+                Binder? binder = null;
+                Type[] types = [typeof(IServiceCollection)];
+                ParameterModifier[]? modifiers = null;
+                // If the instance does not have a ConfigureServices method
+                if (startupType.GetMethod(name, bindingFlags, binder, types, modifiers) is not MethodInfo methodInfo) continue;
+                // Invoke the ConfigureServices method
+                Object? _ = methodInfo.Invoke(instance, [services]);
+            }
+
+            // Register the plugin
+            services.AddTransient(implementationType);
+            services.AddTransient(typeof(TPlugin), implementationType);
+
+            // Build the plugin's service collection as the primary provider
+            IServiceProvider primaryProvider = services.BuildServiceProvider();
+
+            // Initialize a fallback service provider from the primary and host providers
+            IServiceProvider fallbackProvider = new FallbackServiceProvider(primaryProvider, _serviceProvider);
+
+            // Return the built provider
+            return fallbackProvider;
+        }
+
+        [Obsolete]
+        internal async Task<IServiceProvider> RegisterAsync_OLD(Type implementationType, CancellationToken cancellationToken = default)
         {
             // Construct a new service collection for the type
             IServiceCollection services = new ServiceCollection();
@@ -211,15 +296,14 @@ namespace Mauren.Net.Plugin
             _registry.AddOrUpdate(loadContext, addValueFactory, updateValueFactory);
 
             // Get the service provider for the implementation type
-            IServiceProvider serviceProvider = await RegisterAsync(implementationType, cancellationToken);
-            // Initialize event arguments
-            PluginLoadedEventArgs<TPlugin> eventArgs = new()
+            IServiceProvider serviceProvider = GetProvider(implementationType);
+
+            // Invoke plugin load event
+            OnPluginLoaded(new PluginLoadedEventArgs<TPlugin>
             {
                 ImplementationType = implementationType,
                 ServiceProvider = serviceProvider,
-            };
-            // Invoke plugin load event
-            OnPluginLoaded(eventArgs);
+            });
         }
 
         internal async Task<LoadContext<TPlugin>> RemoveAsync(Type implementationType, CancellationToken cancellationToken = default)
@@ -234,15 +318,14 @@ namespace Mauren.Net.Plugin
             _registry.Remove(entry.Key, out ConcurrentBag<Type>? removedTypes);
 
             // Get the service provider for the implementation type
-            IServiceProvider serviceProvider = await RegisterAsync(implementationType, cancellationToken);
-            // Initialize event arguments
-            PluginUnloadedEventArgs<TPlugin> eventArgs = new()
+            IServiceProvider serviceProvider = GetProvider(implementationType);
+
+            // Invoke plugin unload event
+            OnPluginUnloaded(new PluginUnloadedEventArgs<TPlugin>
             {
                 ImplementationType = implementationType,
                 ServiceProvider = serviceProvider,
-            };
-            // Invoke plugin unload event
-            OnPluginUnloaded(eventArgs);
+            });
 
             // Unload the load context
             entry.Key.Unload();
