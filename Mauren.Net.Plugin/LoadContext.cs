@@ -20,12 +20,13 @@ namespace Mauren.Net.Plugin
         /// A string representing the path to the plugin directory.
         /// This path is used to initialize the AssemblyDependencyResolver, which helps locate assemblies and unmanaged DLLs for loading.
         /// </param>
-        public LoadContext(String pluginPath) : base(isCollectible: true)
+        public LoadContext(String pluginPath, String? name = default, Boolean isCollectible = true) : base(name ?? pluginPath, isCollectible)
         {
             // Initialize the resolver with the path to the plugin
             _resolver = new AssemblyDependencyResolver(pluginPath);
         }
 
+        /// <inheritdoc/>
         protected override Assembly? Load(AssemblyName assemblyName)
         {
             // Use the resolver to find the path to the assembly
@@ -42,6 +43,7 @@ namespace Mauren.Net.Plugin
             return null;
         }
 
+        /// <inheritdoc/>
         protected override IntPtr LoadUnmanagedDll(String unmanagedDllName)
         {
             // Use the resolver to find the path to the unmanaged DLL

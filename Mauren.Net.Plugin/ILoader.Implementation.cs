@@ -1,48 +1,35 @@
-﻿using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
+﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.Loader;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace Mauren.Net.Plugin
 {
-    public partial class Loader<TPlugin> : ILoader<TPlugin>
+    public partial class Loader<TContract> : ILoader<TContract>
     {
-        private readonly ILogger<Loader<TPlugin>> _logger;
-        private readonly ConcurrentDictionary<LoadContext<TPlugin>, ConcurrentBag<Type>> _registry;
-        /// <summary>
-        /// The host application's <see cref="IServiceProvider"/>.
-        /// </summary>
-        private readonly IServiceProvider _serviceProvider;
+        private readonly ILogger<Loader<TContract>> _logger;
+        private readonly IServiceRegistrationStrategy _strategy;
+        private readonly IEnumerable<ServiceDescriptor> _hostDescriptors;
 
-        public event EventHandler<PluginLoadedEventArgs<TPlugin>>? PluginLoaded;
-        protected virtual void OnPluginLoaded(PluginLoadedEventArgs<TPlugin> e)
-        {
-            PluginLoaded?.Invoke(this, e);
-        }
+        private readonly ConcurrentDictionary<String, IPluginBundle<TContract>> _registry;
 
-        public event EventHandler<PluginUnloadedEventArgs<TPlugin>>? PluginUnloaded;
-        protected virtual void OnPluginUnloaded(PluginUnloadedEventArgs<TPlugin> e)
-        {
-            PluginUnloaded?.Invoke(this, e);
-        }
+        public event EventHandler<IPluginBundle<TContract>>? PluginLoaded;
+        public event EventHandler<IPluginBundle<TContract>>? PluginUnloaded;
 
-        public Loader(ILogger<Loader<TPlugin>> logger, IServiceProvider serviceProvider)
+        public Loader(ILogger<Loader<TContract>> logger, IServiceRegistrationStrategy strategy, IEnumerable<ServiceDescriptor> hostDescriptors)
         {
             _logger = logger;
-            _serviceProvider = serviceProvider;
-            _registry = new();
-        }
+            _strategy = strategy;
+            _hostDescriptors = hostDescriptors;
 
-        public DirectoryInfo GetDirectoryFromConfiguration(IConfiguration configuration, String key = "PluginPath", String defaultValue = "./Plugins")
-        {
-            // Read the path value from configuration
-            String path = configuration.GetValue<String>(key, defaultValue);
-            // Initialize directory info
-            DirectoryInfo directoryInfo = new(path);
-            // Return directory info
-            return directoryInfo;
+            _registry = new();
         }
 
         public async Task ScanAsync(DirectoryInfo directory, CancellationToken cancellationToken = default)
@@ -53,7 +40,7 @@ namespace Mauren.Net.Plugin
             // Ensure the log level is enabled
             if (_logger.IsEnabled(LogLevel.Information))
                 // Log information
-                _logger.Log(LogLevel.Information, "Directory scan starting for '{path}': Discovering {type}", directory.FullName, typeof(TPlugin).Name);
+                _logger.Log(LogLevel.Information, "Directory scan starting for '{path}': Discovering {type}", directory.FullName, typeof(TContract).Name);
 
             // Enumerate files in directory
             IEnumerable<FileInfo> files = directory.EnumerateFiles("*.dll", SearchOption.AllDirectories);
@@ -61,279 +48,35 @@ namespace Mauren.Net.Plugin
             // Iterate through the plugin assembly files and load them into their own LoadContext
             foreach (FileInfo file in files)
             {
-                // Initialize an assembly load context
-                AssemblyLoadContext? assemblyLoadContext = null;
-
                 try
                 {
-                    // If the file's directory name is null
-                    if (file.DirectoryName is not String directoryName)
-                        // Throw exception
-                        throw new DirectoryNotFoundException("Could not determine directory name");
+                    // Bundle the assembly referenced by the file info
+                    IPluginBundle<TContract> bundle = Bundle(file, _hostDescriptors);
 
-                    // Initialize the assembly load context
-                    assemblyLoadContext = new LoadContext<TPlugin>(directoryName);
+                    // Register the bundle
+                    Register(bundle.Id, bundle);
 
-                    // Load the assembly via the load context
-                    Assembly assembly = assemblyLoadContext.LoadFromAssemblyPath(file.FullName);
-
-                    // Discover types exported from the assembly
-                    IEnumerable<Type> discoveredTypes = assembly.GetExportedTypes()
-                        // Filter to types implementing the interface
-                        .Where((Type type) => typeof(TPlugin).IsAssignableFrom(type))
-                        // Filter to non-abstract classes
-                        .Where((Type type) => type.IsClass && !type.IsAbstract);
-
-                    // Ensure the assembly load context is a LoadContext<T> instance
-                    if (assemblyLoadContext is not LoadContext<TPlugin> context)
-                        continue;
-
-                    // Iterate over the discovered types
-                    foreach (Type discoveredType in discoveredTypes)
-                    {
-                        // Add the discovered type
-                        await AddAsync(context, discoveredType, cancellationToken);
-                    }
-
-                    // Ensure the log level is enabled
+                    // Ensure log level is enabled
                     if (_logger.IsEnabled(LogLevel.Debug))
-                        // Log result
-                        _logger.Log(LogLevel.Debug, "Assembly load succeeded for '{file}'", file.FullName);
+                        // Log message
+                        _logger.Log(LogLevel.Debug, "Bundled {file} to bundle {id}", file.Name, bundle.Id ?? "NO_BUNDLE_ID");
                 }
                 catch (Exception exception)
                 {
-                    // Ensure the log level is enabled
-                    if (_logger.IsEnabled(LogLevel.Debug))
+                    // Ensure log level is enabled
+                    if (_logger.IsEnabled(LogLevel.Warning))
                         // Log exception
-                        _logger.Log(LogLevel.Debug, exception, "Assembly load failed for '{file}'", file.FullName);
-                    
-                    // Unload the assembly load context, if initialized
-                    assemblyLoadContext?.Unload();
-
-                    // Skip the file
-                    continue;
+                        _logger.Log(LogLevel.Warning,/*exception,*/"{message}", exception.Message);
                 }
             }
 
             // Ensure the log level is enabled
             if (_logger.IsEnabled(LogLevel.Information))
                 // Log result
-                _logger.Log(LogLevel.Information, "Directory scan complete for '{path}': Discovered {type} ({count})", directory.FullName, typeof(TPlugin).Name, _registry.Count);
+                _logger.Log(LogLevel.Information, "Directory scan complete for '{path}': Discovered {type} ({count})", directory.FullName, typeof(TContract).Name, _registry.Count);
         }
 
-        private Boolean MatchesStartupConvention(Type type)
-        {
-            // If the type's name does not end in 'Startup'
-            if (type.Name.EndsWith("Startup", StringComparison.OrdinalIgnoreCase) is false)
-                return false;
-
-            String name = "ConfigureServices";
-            BindingFlags bindingFlags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static;
-            Binder? binder = null;
-            Type[] types = [typeof(IServiceCollection)];
-            ParameterModifier[]? modifiers = null;
-            // If the type does not have a 'void ConfigureServices(IServiceCollection _)' method
-            if (type.GetMethod(name, bindingFlags, binder, types, modifiers) is not MethodInfo methodInfo || methodInfo.ReturnType != typeof(void))
-                return false;
-
-            return true;
-        }
-
-        internal IServiceProvider GetProvider(Type implementationType)
-        {
-            // Construct a new service collection for the type
-            IServiceCollection services = new ServiceCollection();
-
-            // Get the assembly of the type
-            Assembly assembly = implementationType.Assembly;
-
-            // Get all exported types that implement a manifest
-            IEnumerable<Type> manifestTypes = assembly.GetExportedTypes()
-                // Filter to types that implement a manifest
-                .Where((Type type) => typeof(IServiceManifest).IsAssignableFrom(type))
-                // Filter to non-abstract class types
-                .Where((Type type) => type.IsClass && !type.IsAbstract);
-
-            // Iterate over exported manifest types
-            foreach (Type manifestType in manifestTypes)
-            {
-                // Create an instance of the manifest type
-                Object? instance = Activator.CreateInstance(manifestType);
-                // If the instance is not a manifest, skip
-                if (instance is not IServiceManifest manifest) continue;
-                // Register the manifest's services into the service collection
-                manifest.RegisterServices(services);
-            }
-
-            // Get all exported types that implement the Startup convention
-            IEnumerable<Type> startupTypes = assembly.GetExportedTypes()
-                // Filter to types that match the Startup class convention
-                .Where(MatchesStartupConvention)
-                // Filter to non-abstract class types
-                .Where((Type type) => type.IsClass && !type.IsAbstract);
-
-            // Iterate over exported manifest types
-            foreach (Type startupType in startupTypes)
-            {
-                // Create an instance of the manifest type
-                Object? instance = Activator.CreateInstance(startupType);
-                // If the instance is not a manifest, skip
-                if (instance is not Object startup) continue;
-
-                String name = "ConfigureServices";
-                BindingFlags bindingFlags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static;
-                Binder? binder = null;
-                Type[] types = [typeof(IServiceCollection)];
-                ParameterModifier[]? modifiers = null;
-                // If the instance does not have a ConfigureServices method
-                if (startupType.GetMethod(name, bindingFlags, binder, types, modifiers) is not MethodInfo methodInfo) continue;
-                // Invoke the ConfigureServices method
-                Object? _ = methodInfo.Invoke(instance, [services]);
-            }
-
-            // Register the plugin
-            services.AddTransient(implementationType);
-            services.AddTransient(typeof(TPlugin), implementationType);
-
-            // Build the plugin's service collection as the primary provider
-            IServiceProvider primaryProvider = services.BuildServiceProvider();
-
-            // Initialize a fallback service provider from the primary and host providers
-            IServiceProvider fallbackProvider = new FallbackServiceProvider(primaryProvider, _serviceProvider);
-
-            // Return the built provider
-            return fallbackProvider;
-        }
-
-        [Obsolete]
-        internal async Task<IServiceProvider> RegisterAsync_OLD(Type implementationType, CancellationToken cancellationToken = default)
-        {
-            // Construct a new service collection for the type
-            IServiceCollection services = new ServiceCollection();
-
-            // Determine the constructor to use for the implementation type
-            ConstructorInfo constructor = implementationType.GetConstructors().First();
-            // Get the constructor's parameters
-            ParameterInfo[] parameters = constructor.GetParameters();
-
-            // Iterate over the found parameters
-            foreach (ParameterInfo parameter in parameters)
-            {
-                // Get the load context of the implementation type's assembly
-                AssemblyLoadContext? implementationLoadContext = AssemblyLoadContext.GetLoadContext(implementationType.Assembly);
-                // Get the load context of the dependency type's assembly
-                AssemblyLoadContext? dependencyLoadContext = AssemblyLoadContext.GetLoadContext(parameter.ParameterType.Assembly);
-
-                // If the dependency's load context is the same as the implementation type's load context
-                if (dependencyLoadContext == implementationLoadContext)
-                {
-                    _logger.LogDebug("Looking for {type} dependency {dependencyType} in assembly {name}", implementationType.Name, parameter.ParameterType.Name, implementationType.Assembly.FullName);
-                    // Get the matching dependency from the implementation type's assembly
-                    Type dependency = implementationType.Assembly.GetTypes()
-                        // Filter to types that the parameter's type is assignable from
-                        .Where((Type type) => parameter.ParameterType.IsAssignableFrom(type))
-                        // Filter to non-abstract class types
-                        .Where((Type type) => type.IsClass && !type.IsAbstract)
-                        // Get the only option
-                        .Single();
-
-                    // Add the dependency as a transient implementation of the parameter type
-                    services.AddTransient(parameter.ParameterType, dependency);
-                }
-                // If the dependency's load context is not the same as the implementation type's load context
-                else
-                {
-                    _logger.LogDebug("Looking for {type} dependency {dependencyType} in host service provider", implementationType.Name, parameter.ParameterType.Name);
-                    // Get a matching dependency from the host application's service provider
-                    Object dependency = _serviceProvider.GetRequiredService(parameter.ParameterType) switch
-                    {
-                        Object value => value,
-                        _ => throw new InvalidOperationException($"Failed to resolve dependency '{parameter.ParameterType.FullName}'"),
-                    };
-
-                    // Add the dependency as a singleton implementation of the parameter type
-                    services.AddSingleton(parameter.ParameterType, dependency);
-                }
-            }
-
-            // Register the plugin
-            services.AddTransient(implementationType);
-            services.AddTransient(typeof(TPlugin), implementationType);
-
-            // Build the service provider
-            ServiceProvider provider = services.BuildServiceProvider(new ServiceProviderOptions
-            {
-                ValidateOnBuild = false,
-                ValidateScopes = false,
-            });
-
-            // Return the built provider
-            return provider;
-        }
-
-        internal async Task AddAsync(LoadContext<TPlugin> loadContext, Type implementationType, CancellationToken cancellationToken = default)
-        {
-            // Define behavior for adding a new load context entry
-            Func<LoadContext<TPlugin>, ConcurrentBag<Type>> addValueFactory = (LoadContext<TPlugin> _) =>
-            {
-                // Create a new bag from the added implementation type
-                ConcurrentBag<Type> implementationTypes = new() { implementationType };
-                // Return the created bag
-                return implementationTypes;
-
-            };
-
-            // Define behavior for updating an existing load context entry
-            Func<LoadContext<TPlugin>, ConcurrentBag<Type>, ConcurrentBag<Type>> updateValueFactory = (LoadContext<TPlugin> _, ConcurrentBag<Type> implementationTypes) =>
-            {
-                // Update the existing bag with the added implementation type
-                implementationTypes.Add(implementationType);
-                // Return the updated bag
-                return implementationTypes;
-            };
-            // Update the registry
-            _registry.AddOrUpdate(loadContext, addValueFactory, updateValueFactory);
-
-            // Get the service provider for the implementation type
-            IServiceProvider serviceProvider = GetProvider(implementationType);
-
-            // Invoke plugin load event
-            OnPluginLoaded(new PluginLoadedEventArgs<TPlugin>
-            {
-                ImplementationType = implementationType,
-                ServiceProvider = serviceProvider,
-            });
-        }
-
-        internal async Task<LoadContext<TPlugin>> RemoveAsync(Type implementationType, CancellationToken cancellationToken = default)
-        {
-            KeyValuePair<LoadContext<TPlugin>, ConcurrentBag<Type>> entry = _registry
-                // Filter to entries that contain the implementation type
-                .Where((KeyValuePair<LoadContext<TPlugin>, ConcurrentBag<Type>> entry) => entry.Value.Contains(implementationType))
-                // Get the only entry or default
-                .SingleOrDefault();
-
-            // Remove the load context from the registry
-            _registry.Remove(entry.Key, out ConcurrentBag<Type>? removedTypes);
-
-            // Get the service provider for the implementation type
-            IServiceProvider serviceProvider = GetProvider(implementationType);
-
-            // Invoke plugin unload event
-            OnPluginUnloaded(new PluginUnloadedEventArgs<TPlugin>
-            {
-                ImplementationType = implementationType,
-                ServiceProvider = serviceProvider,
-            });
-
-            // Unload the load context
-            entry.Key.Unload();
-
-            // Return the unloaded load context
-            return entry.Key;
-        }
-
-        private void EnsureDirectoryExists(DirectoryInfo directoryInfo, Boolean createIfNotExists = true)
+        void EnsureDirectoryExists(DirectoryInfo directoryInfo, Boolean createIfNotExists = true)
         {
             // If the directory does not exist
             if (directoryInfo.Exists is false)
@@ -358,6 +101,255 @@ namespace Mauren.Net.Plugin
                 // Otherwise
                 else throw new DirectoryNotFoundException();
             }
+        }
+
+        /// <summary>
+        /// Bundles the provided <paramref name="fileInfo">file</paramref>'s <see cref="Assembly"/>
+        /// as a plugin bundle.
+        /// </summary>
+        /// 
+        /// <param name="fileInfo">
+        /// Metadata representing the file to load.
+        /// </param>
+        /// 
+        /// <param name="serviceDescriptors">
+        /// An <see cref="IEnumerable{T}"/> of <see cref="ServiceDescriptor"/>s to be included in
+        /// the <see cref="IPluginBundle{TContract}"/> instance's service provider.
+        /// </param>
+        /// 
+        /// <returns></returns>
+        IPluginBundle<TContract> Bundle(FileInfo fileInfo, IEnumerable<ServiceDescriptor>? serviceDescriptors = default)
+        {
+            // Initialize an assembly load context
+            AssemblyLoadContext? assemblyLoadContext = null;
+
+            try
+            {
+                // Load the file into an assembly load context
+                assemblyLoadContext = Load(fileInfo);
+
+                // Create a service collection or the assembly load context
+                IServiceCollection services = GetServices(assemblyLoadContext, _strategy);
+
+                // Discover all types loaded by the assembly load context
+                IEnumerable<Type> types = GetTypes(assemblyLoadContext);
+
+                // Iterate over discovered types
+                foreach (Type type in types)
+                {
+                    // Add the discovered type to the service collection
+                    services.AddTransient(type);
+                }
+
+                // Iterate over provided service descriptors (if provided)
+                foreach (ServiceDescriptor serviceDescriptor in serviceDescriptors ?? [])
+                {
+                    // Add the service descriptor to the service collection
+                    services.Add(serviceDescriptor);
+                }
+
+                // Build the service provider
+                ServiceProvider serviceProvider = services.BuildServiceProvider();
+
+                // Initialize the plugin bundle
+                IPluginBundle<TContract> bundle = new PluginBundle<TContract>(assemblyLoadContext, serviceProvider, types);
+
+                // Return the bundle
+                return bundle;
+            }
+            catch (Exception exception)
+            {
+                // Unload the assembly load context, if initialized
+                assemblyLoadContext?.Unload();
+
+                // Rethrow exception
+                throw new Exception($"Plugin bundling failed for {fileInfo.Name}", exception);
+            }
+        }
+
+        /// <summary>
+        /// Loads an <see cref="Assembly"/> file into an <see cref="AssemblyLoadContext"/>.
+        /// </summary>
+        /// 
+        /// <param name="fileInfo">
+        /// Metadata representing the file to load.
+        /// </param>
+        /// 
+        /// <returns>
+        /// An <see cref="AssemblyLoadContext"/> containing the <see cref="Assembly"/>
+        /// loaded from the provided <paramref name="fileInfo"/>.
+        /// </returns>
+        /// 
+        /// <exception cref="Exception"></exception>
+        AssemblyLoadContext Load(FileInfo fileInfo)
+        {
+            // Initialize variable for the assembly load context
+            AssemblyLoadContext? assemblyLoadContext = null;
+
+            try
+            {
+                // If the file's directory is null
+                if (fileInfo.Directory is not DirectoryInfo directoryInfo)
+                    // Throw exception
+                    throw new DirectoryNotFoundException($"Could not determine directory for {fileInfo.Name}");
+
+                // Initialize an assembly load context for the file's directory
+                assemblyLoadContext = new LoadContext<TContract>(directoryInfo.FullName);
+
+                // Load the file as an assembly
+                assemblyLoadContext.LoadFromAssemblyPath(fileInfo.FullName);
+
+                // Return the assembly load context
+                return assemblyLoadContext;
+            }
+            catch (Exception exception)
+            {
+                // Unload the assembly load context
+                assemblyLoadContext?.Unload();
+
+                // Encapsulate exception and throw
+                throw new Exception($"{nameof(Assembly)} load failed for {fileInfo.Name}", exception);
+            }
+        }
+
+        /// <summary>
+        /// Discovers all <see cref="Type"/>s assignable to <typeparamref name="TContract"/>
+        /// in the provided <paramref name="assemblyLoadContext"/>.
+        /// </summary>
+        /// 
+        /// <param name="assemblyLoadContext">
+        /// The <see cref="AssemblyLoadContext"/> from which to discover types.
+        /// </param>
+        /// 
+        /// <returns>
+        /// An <see cref="IEnumerable{T}"/> of <see cref="Type"/>s assignable to
+        /// <typeparamref name="TContract"/> contained by the <paramref name="assemblyLoadContext"/>.
+        /// </returns>
+        /// 
+        /// <exception cref="Exception"></exception>
+        IEnumerable<Type> GetTypes(AssemblyLoadContext assemblyLoadContext)
+        {
+            try
+            {
+                // Get all types visible from outside the assemblies
+                IEnumerable<Type> exportedTypes = assemblyLoadContext.Assemblies
+                    // Select exported types from each assembly
+                    .SelectMany((Assembly assembly) => assembly.GetExportedTypes());
+
+                // Filter the exported types to types relevant to the loader
+                IEnumerable<Type> filteredTypes = exportedTypes
+                    // Filter to types implementing the generic type parameter
+                    .Where((Type type) => typeof(TContract).IsAssignableFrom(type))
+                    // Filter to non-abstract classes
+                    .Where((Type type) => type.IsClass && !type.IsAbstract);
+
+                // If no relevant types were discovered
+                if (filteredTypes.Any() is false)
+                    // Throw exception
+                    throw new InvalidOperationException($"No {typeof(Type).Name}s assignable to {typeof(TContract).Name} were discovered");
+
+                // Return the discovered types
+                return filteredTypes;
+            }
+            catch (Exception exception)
+            {
+                // Encapsulate exception and throw
+                throw new Exception($"{typeof(TContract).Name} discovery failed for {assemblyLoadContext.Name}", exception);
+            }
+        }
+
+        /// <summary>
+        /// Discovers services defined in the <paramref name="assemblyLoadContext"/>
+        /// via the provided <typeparamref name="TStrategy"/> <paramref name="strategy"/>.
+        /// </summary>
+        /// 
+        /// <typeparam name="TStrategy">
+        /// A type implementing a strategy for discovering services.
+        /// </typeparam>
+        /// 
+        /// <param name="assemblyLoadContext">
+        /// An assembly load context in which to discover services.
+        /// </param>
+        /// 
+        /// <param name="strategy">
+        /// A <typeparamref name="TStrategy"/> instance to discover services with.
+        /// </param>
+        /// 
+        /// <returns>
+        /// An <see cref="IServiceCollection"/> containing discovered services.
+        /// </returns>
+        /// 
+        /// <exception cref="Exception"></exception>
+        IServiceCollection GetServices<TStrategy>(AssemblyLoadContext assemblyLoadContext, TStrategy strategy) where TStrategy : IServiceRegistrationStrategy
+        {
+            try
+            {
+                // Initialize a service collection
+                IServiceCollection services = new ServiceCollection();
+
+                // Get all types visible from outside the assemblies
+                IEnumerable<Type> exportedTypes = assemblyLoadContext.Assemblies
+                    // Select exported types from each assembly
+                    .SelectMany((Assembly assembly) => assembly.GetExportedTypes());
+
+                // Filter the exported types to types relevant to the registration strategy
+                IEnumerable<Type> filteredTypes = exportedTypes
+                    // Filter to types meeting the strategy's criteria predicate
+                    .Where(strategy.ProvidesServices.Invoke);
+
+                // Iterate over each type containing registration logic
+                foreach (Type type in filteredTypes)
+                {
+                    // Guard against exceptions thrown during registration
+                    try
+                    {
+                        // Apply the type's registration logic
+                        strategy.Apply(type, services);
+                    }
+                    catch (Exception exception)
+                    {
+                        // Ensure the log level is enabled
+                        if (_logger.IsEnabled(LogLevel.Warning))
+                            // Log exception
+                            _logger.Log(LogLevel.Warning, exception, "An exception occurred in {type} during service registration", type.FullName);
+                    }
+                }
+
+                // Return the service collection
+                return services;
+            }
+            catch (Exception exception)
+            {
+                // Encapsulate exception and throw
+                throw new Exception($"Service registration failed for {assemblyLoadContext.Name}", exception);
+            }
+        }
+
+        void Register(String id, IPluginBundle<TContract> bundle)
+        {
+            // Add or update the bundle in the registry
+            _registry.AddOrUpdate(id, bundle, (String _, IPluginBundle<TContract> _) => bundle);
+
+            // Invoke event handler
+            PluginLoaded?.Invoke(this, bundle);
+        }
+
+        void Unregister(String id)
+        {
+            // Remove the bundle by id from the registry
+            if (_registry.TryRemove(id, out IPluginBundle<TContract>? bundle) is false)
+                throw new InvalidOperationException($"Could not find bundle {id} in registry");
+
+            // Invoke event handler
+            PluginUnloaded?.Invoke(this, bundle);
+
+            // If the bundle's service provider is disposable
+            if (bundle.Provider is IDisposable disposable)
+                // Dispose the bundle's service provider
+                disposable.Dispose();
+
+            // Unload the bundle's context
+            bundle.Context.Unload();
         }
     }
 }
