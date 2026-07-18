@@ -3,7 +3,7 @@ using System.Collections.Generic;
 
 namespace Microsoft.Extensions.DependencyInjection
 {
-    public static class ServiceCollectionExtensions
+    public static partial class ServiceCollectionExtensions
     {
         public static IServiceCollection AddPluginLoader<TContract, TStrategy>(this IServiceCollection services)
             where TStrategy : class, IServiceRegistrationStrategy
@@ -16,6 +16,9 @@ namespace Microsoft.Extensions.DependencyInjection
 
             // Register enumerable of host container service descriptors
             services.AddSingleton<IEnumerable<ServiceDescriptor>>(services);
+
+            // Register the hosted service manager
+            services.AddHostedService<PluginHostedServiceManager<TContract>>();
 
             // Return the service collection for chaining
             return services;
