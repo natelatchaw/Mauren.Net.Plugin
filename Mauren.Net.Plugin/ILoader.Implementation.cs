@@ -16,6 +16,7 @@ namespace Mauren.Net.Plugin
     {
         private readonly ILogger<Loader<TContract>> _logger;
         private readonly IServiceRegistrationStrategy _strategy;
+        private readonly IServiceProvider _hostProvider;
         private readonly IEnumerable<ServiceDescriptor> _hostDescriptors;
 
         private readonly ConcurrentDictionary<String, IPluginBundle<TContract>> _registry;
@@ -23,10 +24,11 @@ namespace Mauren.Net.Plugin
         public event EventHandler<IPluginBundle<TContract>>? PluginLoaded;
         public event EventHandler<IPluginBundle<TContract>>? PluginUnloaded;
 
-        public Loader(ILogger<Loader<TContract>> logger, IServiceRegistrationStrategy strategy, IEnumerable<ServiceDescriptor> hostDescriptors)
+        public Loader(ILogger<Loader<TContract>> logger, IServiceRegistrationStrategy strategy, IServiceProvider hostProvider, IEnumerable<ServiceDescriptor> hostDescriptors)
         {
             _logger = logger;
             _strategy = strategy;
+            _hostProvider = hostProvider;
             _hostDescriptors = hostDescriptors;
 
             _registry = new();
@@ -51,7 +53,7 @@ namespace Mauren.Net.Plugin
                 try
                 {
                     // Bundle the assembly referenced by the file info
-                    IPluginBundle<TContract> bundle = Bundle(file, _hostDescriptors);
+                    IPluginBundle<TContract> bundle = Bundle(file, _hostDescriptors, _hostProvider);
 
                     // Register the bundle
                     Register(bundle.Id, bundle);
@@ -64,9 +66,9 @@ namespace Mauren.Net.Plugin
                 catch (Exception exception)
                 {
                     // Ensure log level is enabled
-                    if (_logger.IsEnabled(LogLevel.Warning))
+                    if (_logger.IsEnabled(LogLevel.Debug))
                         // Log exception
-                        _logger.Log(LogLevel.Warning,/*exception,*/"{message}", exception.Message);
+                        _logger.Log(LogLevel.Debug, exception, "{message}", exception.Message);
                 }
             }
 
@@ -117,8 +119,13 @@ namespace Mauren.Net.Plugin
         /// the <see cref="IPluginBundle{TContract}"/> instance's service provider.
         /// </param>
         /// 
+        /// <param name="hostProvider">
+        /// An <see cref="IServiceProvider"/> provided by the application host. Singleton service
+        /// descriptors found in the provider will be added if possible.
+        /// </param>
+        /// 
         /// <returns></returns>
-        IPluginBundle<TContract> Bundle(FileInfo fileInfo, IEnumerable<ServiceDescriptor>? serviceDescriptors = default)
+        IPluginBundle<TContract> Bundle(FileInfo fileInfo, IEnumerable<ServiceDescriptor>? serviceDescriptors = default, IServiceProvider? hostProvider = default)
         {
             // Initialize an assembly load context
             AssemblyLoadContext? assemblyLoadContext = null;
@@ -141,12 +148,8 @@ namespace Mauren.Net.Plugin
                     services.AddTransient(type);
                 }
 
-                // Iterate over provided service descriptors (if provided)
-                foreach (ServiceDescriptor serviceDescriptor in serviceDescriptors ?? [])
-                {
-                    // Add the service descriptor to the service collection
-                    services.Add(serviceDescriptor);
-                }
+                // Provide host services to the service collection
+                ProvideHostServices(services, serviceDescriptors, hostProvider);
 
                 // Build the service provider
                 ServiceProvider serviceProvider = services.BuildServiceProvider();
@@ -322,6 +325,44 @@ namespace Mauren.Net.Plugin
             {
                 // Encapsulate exception and throw
                 throw new Exception($"Service registration failed for {assemblyLoadContext.Name}", exception);
+            }
+        }
+
+        void ProvideHostServices(IServiceCollection services, IEnumerable<ServiceDescriptor>? serviceDescriptors, IServiceProvider? hostProvider = default)
+        {
+            // Iterate over provided service descriptors (if provided)
+            foreach (ServiceDescriptor serviceDescriptor in serviceDescriptors ?? [])
+            {
+                // If the service descriptor lifetime is not singleton
+                if (serviceDescriptor.Lifetime != ServiceLifetime.Singleton)
+                {
+                    // Add the service descriptor to the service collection
+                    services.Add(serviceDescriptor);
+                    // Short-circuit
+                    continue;
+                }
+
+                // Try to add the host provider's singleton service
+                try
+                {
+                    // Get the singleton instance of the provided service descriptor
+                    if (hostProvider?.GetService(serviceDescriptor.ServiceType) is not Object singletonInstance)
+                        // Throw exception
+                        throw new Exception($"Host provider's {serviceDescriptor.ServiceType.Name} was not available");
+
+                    // Add the host provider's instance of the service
+                    services.AddSingleton(serviceDescriptor.ServiceType, singletonInstance);
+                }
+                catch (Exception exception)
+                {
+                    // Ensure log level is enabled
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        // Log exception
+                        _logger.Log(LogLevel.Debug, exception, "Failed to register host provider's singleton instance of {type}, the service descriptor has been added instead", serviceDescriptor.ServiceType);
+
+                    // Fallback to adding the service descriptor
+                    services.Add(serviceDescriptor);
+                }
             }
         }
 

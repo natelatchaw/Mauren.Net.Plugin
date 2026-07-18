@@ -15,13 +15,13 @@ namespace Mauren.Net.Plugin
 
             ConstructorInfo[] cs = type.GetConstructors();
 
-            BindingFlags constructorBindingFlags = BindingFlags.Instance | BindingFlags.Public;
-            Binder? constructorBinder = null;
-            CallingConventions constructorCallingConvention = CallingConventions.Any;
-            Type[] constructorTypes = [typeof(IConfiguration)];
-            ParameterModifier[]? constructorModifiers = null;
-            ConstructorInfo? constructorInfo = type.GetConstructor(constructorBindingFlags, constructorBinder, constructorCallingConvention, constructorTypes, constructorModifiers);
-            var idiomatic = type.GetConstructor(constructorTypes);
+            //BindingFlags constructorBindingFlags = BindingFlags.Instance | BindingFlags.Public;
+            //Binder? constructorBinder = null;
+            //CallingConventions constructorCallingConvention = CallingConventions.Any;
+            //Type[] constructorTypes = [typeof(IConfiguration)];
+            //ParameterModifier[]? constructorModifiers = null;
+            //ConstructorInfo? constructorInfo = type.GetConstructor(constructorBindingFlags, constructorBinder, constructorCallingConvention, constructorTypes, constructorModifiers);
+            ConstructorInfo? constructorInfo = type.GetConstructor([typeof(IConfiguration)]) ?? type.GetConstructor(Type.EmptyTypes);
             if (constructorInfo is null)
                 return false;
 
@@ -31,7 +31,8 @@ namespace Mauren.Net.Plugin
             Type[] types = [typeof(IServiceCollection)];
             ParameterModifier[]? modifiers = null;
             // If the type does not have a 'void ConfigureServices(IServiceCollection _)' method
-            if (type.GetMethod(name, bindingFlags, binder, types, modifiers) is not MethodInfo methodInfo || methodInfo.ReturnType != typeof(void))
+            MethodInfo? methodInfo = type.GetMethod(name, bindingFlags, binder, types, modifiers);
+            if (methodInfo is null || methodInfo.ReturnType != typeof(void))
                 return false;
 
             // If the type is not a class or is abstract
@@ -43,8 +44,19 @@ namespace Mauren.Net.Plugin
 
         public void Apply(Type type, IServiceCollection services)
         {
-            // Create an instance of the manifest type
-            Object? instance = Activator.CreateInstance(type, configuration);
+            Object? instance;
+            if (type.GetConstructor([typeof(IConfiguration)]) is not null)
+            {
+                instance = Activator.CreateInstance(type, configuration);
+            }
+            else if (type.GetConstructor(Type.EmptyTypes) is not null)
+            {
+                instance = Activator.CreateInstance(type);
+            }
+            else
+            {
+                throw new Exception($"Could not determine appropriate constructor for {type.FullName}");
+            }
             // If the instance is not a manifest, skip
             if (instance is not Object startup)
                 return;
